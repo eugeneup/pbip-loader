@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pbip-loader"
-version = "0.2.0a3"
+version = "0.2.0"
 description = "Terminal interface for exporting and updating Power BI definition projects"
 readme = "README.md"
 requires-python = ">=3.12"
