@@ -6,12 +6,23 @@
 
 Нужны Python 3.12+ и Azure CLI. [Установить Azure CLI для Windows](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli-windows?view=azure-cli-latest&pivots=msi) · [Для macOS](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli-macos)
 
-Откройте терминал в папке с исходниками и выполните:
+1. Откройте терминал в папке с исходниками и выполните команду установки.
 
-```powershell
-python -m pip install .
-python -m pbip_loader
-```
+   ```powershell
+   python -m pip install .
+   ```
+
+   Можно указать путь к папке с исходниками явно. Подставьте свой путь.
+
+   ```powershell
+   python -m pip install 'C:\Users\путь до исходников\pbip-loader'
+   ```
+
+2. После установки запустите приложение.
+
+   ```powershell
+   python -m pbip_loader
+   ```
 
 Готовый пакет `.whl` можно скачать из раздела [Releases](https://github.com/eugeneup/pbip-loader/releases) и передать путь к нему вместо точки в команде установки. На macOS используйте `python3`, если команда `python` недоступна.
 
