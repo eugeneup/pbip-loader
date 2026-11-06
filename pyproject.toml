@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pbip-loader"
+version = "0.2.0a3"
+description = "Terminal interface for exporting and updating Power BI definition projects"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["textual>=8.2,<9"]
+classifiers = ["Operating System :: Microsoft :: Windows", "Programming Language :: Python :: 3"]
+
+[project.scripts]
+pbip-loader = "pbip_loader.tui:main"
+pbip-loader-cli = "pbip_loader.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["pbip_loader*"]
