@@ -52,11 +52,17 @@ python -m pbip_loader.cli search 'Sales'
 python -m pbip_loader.cli download '<key из search>'
 python -m pbip_loader.cli publish '<key из search>'
 python -m pbip_loader.cli publish '<key из search>' --yes
+python -m pbip_loader.cli publish '<key из search>' --model-only
+python -m pbip_loader.cli publish '<key из search>' --model-only --yes
+python -m pbip_loader.cli reconcile '<key из search>' '<имя папки publish-… из журнала>'
 ```
 
 - `search --local yes` показывает скачанные проекты, `--local no` — модели без локальной копии. В результате есть ключ модели, список компонентов и путь локальной копии, если она найдена.
-- `download --overwrite` заменяет всю папку проекта, включая локальные правки. `publish` показывает план, `publish --yes` применяет его.
-- `--allow-login` разрешает открыть браузер при отсутствии сессии для `refresh`, `download` и `publish --yes`.
+- `download --overwrite` заменяет всю папку проекта, включая локальные правки. `publish` проверяет локальный пакет и показывает план, `publish --yes` применяет его. С `--model-only` Loader проверяет привязанные отчёты и обновляет только модель.
+- При упаковке отчёта для Fabric Loader добавляет `$schema` в `definition.pbir` и использует подключение к модели в сервисе.
+- При публикации проверяются определения, возвращённые Fabric. В итоговом JSON `verification` показывает учтённые расхождения в служебных метаданных и порядке объектов TMDL. При несовпадении Loader сохраняет полученное определение в журнале сессии.
+- После `rollback_failed` команда `reconcile` проверяет завершение операций и заново считывает объекты. Журнал закрывается только когда каждый объект совпадает с отправленным или резервным определением с учётом подтверждённого повышения уровня совместимости. Команда сохраняет журнал и резервные определения и выполняет только чтение в Fabric.
+- `--allow-login` разрешает открыть браузер при отсутствии сессии для `refresh`, `download`, `publish --yes` и `reconcile`.
 - Итог операции возвращается в stdout как JSON с полем `ok`, ход операции — в stderr. Коды выхода: `0` — успех, `1` — ошибка операции, `2` — неверные аргументы, `130` — прерывание.
 
 ## Локальное хранение

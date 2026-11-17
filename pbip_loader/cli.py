@@ -10,6 +10,7 @@ from .api import Api
 from .auth import BrowserCredential, find_azure_cli
 from .catalog import targets
 from .engine import Engine
+from .project import publish_definition
 from .settings import load_settings, save_settings, settings_path
 from .storage import Store
 
@@ -29,7 +30,11 @@ def parser():
     publish = commands.add_parser("publish", help="Preview a publication or apply it with --yes")
     publish.add_argument("key", help="Model key returned by search")
     publish.add_argument("--yes", action="store_true", help="Apply the publication to the listed remote items")
-    for command in (refresh, download, publish):
+    publish.add_argument("--model-only", action="store_true", help="Update only the semantic model")
+    reconcile = commands.add_parser("reconcile", help="Verify the service and resolve a failed rollback journal")
+    reconcile.add_argument("key", help="Model key returned by search")
+    reconcile.add_argument("session", help="Publication session directory name from the error message")
+    for command in (refresh, download, publish, reconcile):
         command.add_argument("--allow-login", action="store_true", help="Allow opening a browser to sign in")
     return root
 
@@ -85,8 +90,12 @@ def run(args, *, notify=None, on_progress=lambda done, total: None, reviewed=Non
         if args.command == "publish" and not args.yes:
             engine = Engine(store, None)
             engine.require_resolved(target)
-            project, _ = engine.local_record(target, verify_files=False)
-            return {"applied": False, "path": str(project), "target": target}
+            project, record = engine.local_record(target)
+            components = record["components"][:1] if args.model_only else record["components"]
+            for component in components:
+                publish_definition(project, component, components[0])
+            plan = {**target, "components": target["components"][:len(components)]}
+            return {"applied": False, "path": str(project), "target": plan}
 
     if not find_azure_cli():
         raise RuntimeError("Установите Microsoft Azure CLI для операций с Power BI.")
@@ -101,8 +110,10 @@ def run(args, *, notify=None, on_progress=lambda done, total: None, reviewed=Non
     if args.command == "download":
         previous = reviewed["path"] if reviewed is not None and args.overwrite else None
         return engine.download(target, overwrite=args.overwrite, expected_previous_path=previous)
+    if args.command == "reconcile":
+        return engine.reconcile(target, args.session)
     path = reviewed["path"] if reviewed is not None else None
-    return {"applied": True, **engine.publish(target, expected_path=path)}
+    return {"applied": True, **engine.publish(target, expected_path=path, model_only=args.model_only)}
 
 
 def main(argv=None):

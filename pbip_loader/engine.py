@@ -5,12 +5,17 @@ import json
 from pathlib import Path
 import shutil
 
-from .api import Indeterminate
+from .api import Indeterminate, Rejected
 from .auth import PBI_SCOPE
 from .catalog import collect, live_target, targets
-from .project import (component_folder, decode, folder_name, make_entries, normalized, part_path,
-                      publish_definition, validate, verify_fingerprints, verify_remote, write_component)
-from .storage import dump, now
+from .project import (component_folder, decode, folder_name, make_entries, part_path,
+                      publish_definition, validate, verify_fingerprints, write_component)
+from .readback import compatibility, verify_publication
+from .storage import dump, linked, now
+
+
+RESOLVED_PUBLICATIONS = {"succeeded", "rolled_back", "rolled_back_with_compatibility_change",
+                         "preflight_failed", "reconciled"}
 
 
 def component_ids(components):
@@ -171,7 +176,7 @@ class Engine:
         pending = {}
         for path in self.store.sessions.glob("publish-*/journal.json"):
             journal = json.loads(path.read_text(encoding="utf-8"))
-            if journal["state"] not in {"succeeded", "rolled_back", "preflight_failed"}:
+            if journal["state"] not in RESOLVED_PUBLICATIONS:
                 pending[journal["target"]["key"]] = path
         return pending
 
@@ -180,9 +185,64 @@ class Engine:
         if path is not None:
             raise RuntimeError("Есть незавершённая публикация. Сначала проверьте сервис и журнал: " + str(path))
 
-    def publish(self, target, *, expected_path=None):
+    def reconcile(self, target, session_name):
+        """Resolve a failed rollback after independent verification, without updating Fabric."""
         with self.store.locked():
-            count = len(target["components"])
+            catalog = self.current(target)
+            session = self.store.session_path(session_name, prefix="publish")
+
+            def read(name):
+                path = session / name
+                if linked(path):
+                    raise ValueError("Недопустимый файл журнала")
+                return json.loads(path.read_text(encoding="utf-8"))
+
+            journal = read("journal.json")
+            if journal["target"]["key"] != target["key"] or journal["state"] != "rollback_failed":
+                raise ValueError("Журнал этого проекта не находится в состоянии rollback_failed")
+            components = journal["components"]
+            ids = component_ids(components)
+            current_ids = component_ids(target["components"])
+            if ids not in (current_ids, current_ids[:1]):
+                raise ValueError("Состав объектов в журнале отличается от текущего")
+            operations = []
+            for op in journal.get("operations", []):
+                body = self.api.get("fabric", op["url"])
+                if body.get("status") not in {"Succeeded", "Failed", "Cancelled"}:
+                    raise RuntimeError("Операция Fabric ещё не завершилась: " + op["url"])
+                operations.append({**op, "status": body["status"]})
+            rollback = journal.get("rollback_inflight")
+            # Publication can reach rollback only after a definite update outcome.
+            # The last rollback write may still be running if its response was lost.
+            if rollback is not None and rollback != journal.get("rollback_update_finished"):
+                if rollback not in journal.get("rollback_completed", []) and not any(
+                    o["phase"] == "rolling_back" and o["index"] == rollback for o in operations
+                ):
+                    raise RuntimeError("Журнал не подтверждает завершение всех операций Fabric")
+            self.live(target, catalog)
+            verified = []
+            for index, (component, actual) in enumerate(self.definitions(components)):
+                desired = read(f"desired-{index}.json")
+                backup = read(f"backup-{index}.json")
+                kind = component["kind"]
+                try:
+                    result = verify_publication(desired, actual, kind)
+                    source = "desired"
+                except ValueError:
+                    retained = (compatibility(decode(desired))
+                                if kind == "SemanticModel" and index in journal["completed"] else None)
+                    result = verify_publication(backup, actual, kind, retained_level=retained)
+                    source = "backup"
+                verified.append({"index": index, "kind": kind, "matches": source, **result})
+            journal["reconciliation"] = {"previous_state": journal["state"], "checked_at": now(),
+                                         "operations": operations, "verified": verified}
+            journal["state"] = "reconciled"
+            dump(session / "journal.json", journal)
+            return {"status": "reconciled", "verified": verified, "path": str(session / "journal.json")}
+
+    def publish(self, target, *, expected_path=None, model_only=False):
+        with self.store.locked():
+            count = 1 if model_only else len(target["components"])
             total = 3 * count + 2
             self.on_progress(0, total)
             self.notify("Предварительная проверка модели и отчётов…")
@@ -194,7 +254,7 @@ class Engine:
             if record["identity"] != catalog["identity"]:
                 raise ValueError("Проект принадлежит другой учётной записи.")
             self.live(target)
-            components = record["components"]
+            components = record["components"][:count]
             self.on_progress(1, total)
             desired = []
             session = self.store.new_session("publish")
@@ -203,7 +263,7 @@ class Engine:
             path = session / "journal.json"
             dump(path, journal)
             backups = []
-            backup_hashes = []
+            requested_levels = []
 
             def accepted(location):
                 journal.setdefault("operations", []).append({
@@ -217,14 +277,23 @@ class Engine:
                 for index, (component, backup) in enumerate(self.definitions(components)):
                     # Validate every backup before sending even the first update.
                     backup_files = decode(backup)
-                    backup_hashes.append(normalized(backup_files))
                     backups.append(backup)
                     # Use the current service reference, including after a remote rename.
                     source = component
                     if component["kind"] == "Report":
-                        reference = json.loads(backup_files["definition.pbir"]).get("datasetReference")
+                        reference = json.loads(backup_files["definition.pbir"].decode("utf-8-sig")).get("datasetReference")
                         source = {**component, "service_reference": reference}
                     desired.append(publish_definition(root, source, components[0]))
+                    level = None
+                    if component["kind"] == "SemanticModel":
+                        previous = compatibility(backup_files)
+                        pending = compatibility(decode(desired[-1]))
+                        if previous is not None and pending is not None and previous != pending:
+                            self.notify(f"Уровень совместимости модели: {previous} → {pending}")
+                            journal["compatibility"] = {"previous": previous, "requested": pending}
+                            if pending > previous:
+                                level = pending
+                    requested_levels.append(level)
                     dump(session / f"backup-{index}.json", backup)
                     dump(session / f"desired-{index}.json", desired[index])
                     self.on_progress(index + 2, total)
@@ -247,8 +316,12 @@ class Engine:
                 self.notify("Чтение опубликованных определений из Power BI Service…")
                 for index, (component, actual) in enumerate(self.definitions(components)):
                     self.notify(f"Проверка определения: {component['name']}")
-                    parts = verify_remote(desired[index], actual)
-                    journal["verified"].append({"index": index, "parts": parts})
+                    try:
+                        result = verify_publication(desired[index], actual, component["kind"])
+                    except ValueError:
+                        dump(session / f"actual-{index}.json", actual)
+                        raise
+                    journal["verified"].append({"index": index, **result})
                     dump(path, journal)
                     self.on_progress(2 * count + index + 2, total)
                 self.notify("Проверка связей опубликованных компонентов…")
@@ -266,6 +339,7 @@ class Engine:
                     self.on_progress(0, 0)
                     journal["state"] = "rolling_back"
                     journal["rollback_completed"] = []
+                    journal["rollback_verification"] = []
                     dump(path, journal)
                     try:
                         # Restore model first, then its reports. Data purge stays disabled.
@@ -273,14 +347,31 @@ class Engine:
                             self.notify("Откат: " + components[index]["name"])
                             journal["rollback_inflight"] = index
                             dump(path, journal)
-                            self.api.update(components[index], backups[index])
-                            verify_fingerprints(backup_hashes[index], self.api.definition(components[index]))
-                            journal["rollback_completed"].append(index)
-                            journal.pop("rollback_inflight", None)
+                            try:
+                                self.api.update(components[index], backups[index])
+                            except Rejected:
+                                journal["rollback_update_finished"] = index
+                                raise
+                            journal["rollback_update_finished"] = index
                             dump(path, journal)
-                        journal["state"] = "rolled_back"
-                    except BaseException:
+                            actual = self.api.definition(components[index])
+                            try:
+                                restored = verify_publication(backups[index], actual, components[index]["kind"],
+                                                              retained_level=requested_levels[index])
+                            except ValueError:
+                                dump(session / f"rollback-actual-{index}.json", actual)
+                                raise
+                            journal["rollback_completed"].append(index)
+                            journal["rollback_verification"].append({"index": index, **restored})
+                            journal.pop("rollback_inflight", None)
+                            journal.pop("rollback_update_finished", None)
+                            dump(path, journal)
+                        retained = any("definition/database.tmdl" in r.get("adjustments", {})
+                                       for r in journal["rollback_verification"])
+                        journal["state"] = "rolled_back_with_compatibility_change" if retained else "rolled_back"
+                    except BaseException as rollback_error:
                         journal["state"] = "rollback_failed"
+                        journal["rollback_error"] = str(rollback_error)
                 dump(path, journal)
                 raise RuntimeError(f"Публикация не завершена ({journal['state']}). {exc}\nЖурнал и резервные определения: {session}") from exc
             finally:
@@ -288,7 +379,7 @@ class Engine:
             journal["state"] = "succeeded"
             dump(path, journal)
             result = {"status": "verified", "published": component_summary(components), "components": len(components),
-                      "parts": sum(x["parts"] for x in journal["verified"])}
+                      "parts": sum(x["parts"] for x in journal["verified"]), "verification": journal["verified"]}
             shutil.rmtree(session, ignore_errors=True)
             self.on_progress(total, total)
             return result

@@ -136,8 +136,8 @@ class Store:
         session.mkdir()
         return session
 
-    def session_path(self, name):
-        if Path(name).name != name or not name.startswith("download-"):
+    def session_path(self, name, *, prefix="download"):
+        if Path(name).name != name or not name.startswith(prefix + "-"):
             raise ValueError("Invalid recovery session")
         session = self.sessions / name
         if linked(session) or session.resolve().parent != self.sessions.resolve():
