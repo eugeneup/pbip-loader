@@ -9,6 +9,8 @@ import unicodedata
 from .storage import RESERVED, dump, linked
 
 JSON_SUFFIXES = {".json", ".pbir", ".pbism", ".bim", ".pbip"}
+MODEL_SCHEMA = "https://developer.microsoft.com/json-schemas/fabric/item/semanticModel/definitionProperties/1.0.0/schema.json"
+REPORT_SCHEMA = "https://developer.microsoft.com/json-schemas/fabric/item/report/definitionProperties/2.0.0/schema.json"
 
 
 def safe_name(name, limit=55):
@@ -115,7 +117,10 @@ def verify_remote(expected, actual):
 
 
 def verify_fingerprints(left, actual):
-    right = normalized(decode(actual))
+    return verify_part_hashes(left, normalized(decode(actual)))
+
+
+def verify_part_hashes(left, right):
     if left != right:
         missing, extra = sorted(left.keys() - right.keys()), sorted(right.keys() - left.keys())
         changed = sorted(p for p in left.keys() & right.keys() if left[p] != right[p])
@@ -231,18 +236,32 @@ def validate(root, components):
 
 def publish_definition(root, component, model):
     files = read_component(root, component)
+    if component["kind"] == "SemanticModel":
+        properties = json.loads(files["definition.pbism"].decode("utf-8-sig"))
+        if not isinstance(properties, dict):
+            raise ValueError("Некорректный definition.pbism")
+        if "$schema" not in properties:
+            properties["$schema"] = MODEL_SCHEMA
+            files["definition.pbism"] = json.dumps(properties, ensure_ascii=False).encode("utf-8")
     if component["kind"] == "Report":
         value = json.loads(files["definition.pbir"].decode("utf-8-sig"))
+        if not isinstance(value.get("version"), str) or not re.fullmatch(r"\d+\.\d+", value["version"]):
+            raise ValueError("Некорректная версия definition.pbir")
+        if set(value) - {"$schema", "version", "datasetReference"}:
+            raise ValueError("Неподдерживаемые свойства definition.pbir")
         reference = component.get("service_reference", {})
-        if isinstance(reference, dict) and isinstance(reference.get("byConnection", {}).get("connectionString"), str):
-            value["datasetReference"] = reference
+        by_connection = reference.get("byConnection") if isinstance(reference, dict) else None
+        existing = by_connection.get("connectionString") if isinstance(by_connection, dict) else None
+        if isinstance(existing, str) and existing.strip():
+            connection = existing
         else:
             def quoted(text):
                 return '"' + text.replace('"', '""') + '"'
             connection = (f"Data Source={quoted('powerbi://api.powerbi.com/v1.0/myorg/' + model['workspace_name'])};"
                           f"Initial Catalog={quoted(model['name'])};Integrated Security=ClaimsToken;"
                           f"semanticmodelid={model['id']}")
-            value["$schema"] = "https://developer.microsoft.com/json-schemas/fabric/item/report/definitionProperties/2.0.0/schema.json"
-            value["datasetReference"] = {"byConnection": {"connectionString": connection}}
+        # The emitted byConnection object uses the Fabric report properties v2 contract.
+        value["$schema"] = REPORT_SCHEMA
+        value["datasetReference"] = {"byConnection": {"connectionString": connection}}
         files["definition.pbir"] = json.dumps(value, ensure_ascii=False).encode("utf-8")
     return encode(files)

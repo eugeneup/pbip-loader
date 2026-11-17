@@ -9,7 +9,8 @@ from unittest.mock import patch
 from pbip_loader.api import Indeterminate, Rejected
 from pbip_loader.catalog import collect, targets
 from pbip_loader.engine import Engine
-from pbip_loader.project import decode, encode, folder_name, part_path, safe_name, verify_remote
+from pbip_loader.project import MODEL_SCHEMA, REPORT_SCHEMA, decode, encode, folder_name, part_path, safe_name, verify_remote
+from pbip_loader.readback import verify_publication
 from pbip_loader.storage import Store, dump
 
 W = "00000000-0000-0000-0000-000000000001"
@@ -257,6 +258,81 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual([M, R1, R2], self.api.updates)
         self.assertEqual([], list(self.store.sessions.iterdir()))
 
+    def test_model_only_updates_only_model_and_preserves_live_reports(self):
+        root = self.pull()
+        self.edit_model(root)
+        original_report = copy.deepcopy(self.api.remote[R1])
+        result = self.engine.publish(self.target, model_only=True)
+        self.assertEqual("verified", result["status"])
+        self.assertEqual([M], self.api.updates)
+        self.assertEqual([M], [item["id"] for item in result["published"]])
+        self.assertEqual(original_report, self.api.remote[R1])
+
+    def test_publication_adds_report_schema_when_copying_service_connection(self):
+        self.pull()
+        previous = json.loads(decode(self.api.remote[R1])["definition.pbir"])
+        self.assertNotIn("$schema", previous)
+        self.engine.publish(self.target)
+        actual = json.loads(decode(self.api.remote[R1])["definition.pbir"])
+        self.assertEqual(previous["datasetReference"], actual["datasetReference"])
+        self.assertEqual(REPORT_SCHEMA, actual["$schema"])
+
+    def test_reconcile_verifies_each_component_before_resolving_journal(self):
+        root = self.pull()
+        self.edit_model(root)
+        self.api.fail_id, self.api.fail_mode = R2, "rollback"
+        with self.assertRaisesRegex(RuntimeError, "rollback_failed"):
+            self.engine.publish(self.target)
+        path = next(self.store.sessions.glob("publish-*/journal.json"))
+        journal = self.journal()
+        journal["operations"] = [
+            {"phase": "publishing", "index": 2, "url": "operations/first"},
+            {"phase": "rolling_back", "index": 2, "url": "operations/second"},
+        ]
+        dump(path, journal)
+        read = self.api.get
+        updates = self.api.updates.copy()
+        actual = copy.deepcopy(self.api.remote[R1])
+        with patch.object(self.api, "get", return_value={"status": "Running"}):
+            with self.assertRaisesRegex(RuntimeError, "ещё не завершилась"):
+                self.engine.reconcile(self.target, path.parent.name)
+        self.assertEqual("rollback_failed", self.journal()["state"])
+        self.api.remote[R1] = FakeApi.report()
+        self.api.remote[R1]["definition"]["parts"].append(definition({"unexpected.json": "{}"})["definition"]["parts"][0])
+        with patch.object(self.api, "get", side_effect=lambda service, url:
+                          {"status": "Failed"} if url.startswith("operations/") else read(service, url)):
+            with self.assertRaises(ValueError):
+                self.engine.reconcile(self.target, path.parent.name)
+            self.assertEqual("rollback_failed", self.journal()["state"])
+            self.api.remote[R1] = actual
+            result = self.engine.reconcile(self.target, path.parent.name)
+        self.assertEqual("reconciled", result["status"])
+        self.assertEqual(updates, self.api.updates)
+        self.assertEqual("rollback_failed", self.journal()["reconciliation"]["previous_state"])
+        self.engine.require_resolved(self.target)
+
+    def test_reconcile_accepts_terminal_synchronous_rollback_failure(self):
+        root = self.pull()
+        self.edit_model(root)
+        self.api.fail_id, self.api.fail_mode = R2, "rollback"
+        with self.assertRaisesRegex(RuntimeError, "rollback_failed"):
+            self.engine.publish(self.target)
+        session = next(self.store.sessions.glob("publish-*"))
+        updates = self.api.updates.copy()
+
+        journal = self.journal()
+        finished = journal.pop("rollback_update_finished")
+        dump(session / "journal.json", journal)
+        with self.assertRaisesRegex(RuntimeError, "не подтверждает завершение"):
+            self.engine.reconcile(self.target, session.name)
+
+        journal["rollback_update_finished"] = finished
+        dump(session / "journal.json", journal)
+        result = self.engine.reconcile(self.target, session.name)
+        self.assertEqual("reconciled", result["status"])
+        self.assertEqual(updates, self.api.updates)
+        self.engine.require_resolved(self.target)
+
     def test_terminal_last_report_failure_restores_all_attempted_definitions(self):
         root = self.pull()
         old = copy.deepcopy(self.api.remote)
@@ -496,6 +572,71 @@ class DefinitionTests(unittest.TestCase):
         self.assertEqual(2, verify_remote(
             definition({"a.json": '{"a":1,"b":2}', "definition/model.tmdl": "model A\r\n"}),
             definition({"a.json": '{"b":2, "a":1}', "definition/model.tmdl": "model A\n"})))
+
+    def test_semantic_model_readback_accepts_known_fabric_adjustments(self):
+        model = "definition/model.tmdl"
+        props = "definition.pbism"
+        expected = {model: "model Model\n\nannotation __PBI_ServiceStoredInTmdl = reserved\n\nref table B\nref table A\n",
+                    props: '{"version":"4.2","settings":{}}', "diagramLayout.json": "{}"}
+        actual = {model: "model Model\n\nref table A\nref table B\n",
+                  props: json.dumps({"version": "4.2", "settings": {}, "$schema": MODEL_SCHEMA})}
+        result = verify_publication(definition(expected), definition(actual), "SemanticModel")
+        self.assertEqual(
+            {"diagramLayout.json": ["optional_part_presence"], props: ["default_schema"],
+             model: ["reserved_storage_marker", "table_reference_order"]},
+            result["adjustments"])
+        for change in (
+            {model: "model Model\n\nref table C\nref table B\n"},
+            {props: json.dumps({"version": "4.2", "settings": {"changed": True}, "$schema": MODEL_SCHEMA})},
+            {"diagramLayout.json": '{"wrong":true}'},
+        ):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                verify_publication(definition(expected), definition({**actual, **change}), "SemanticModel")
+
+    def test_rollback_verifies_object_definitions_and_only_allows_the_requested_level(self):
+        db = "definition/database.tmdl"
+        table = "definition/tables/Table.tmdl"
+        prefix = "table Table\n\n"
+        a = "\tcolumn A\n\t\tdataType: int64"
+        b = "\tcolumn B\n\t\tdataType: string"
+        expected = {db: "database\n\tcompatibilityLevel: 1600",
+                    table: prefix + a + "\n\n" + b}
+        actual = {db: "database\n\tcompatibilityLevel: 1606",
+                  table: prefix + b + "\n\n" + a}
+        for level in (None, 1605):
+            with self.assertRaises(ValueError):
+                verify_publication(definition(expected), definition(actual), "SemanticModel", retained_level=level)
+        result = verify_publication(definition(expected), definition(actual), "SemanticModel", retained_level=1606)
+        self.assertEqual(["collection_order"], result["adjustments"][table])
+        actual[table] = prefix + b + "\n\n" + a.replace("int64", "string")
+        with self.assertRaises(ValueError):
+            verify_publication(definition(expected), definition(actual), "SemanticModel", retained_level=1606)
+
+    def test_reordered_queries_and_relationships_still_require_exact_definitions(self):
+        cases = (
+            ("definition/expressions.tmdl", "expression A =\n\tlet x = 1 in x",
+             "expression B = 2", "x = 1", "x = 9"),
+            ("definition/relationships.tmdl", "relationship A\n\tfromColumn: Sales.Customer",
+             "relationship B\n\tfromColumn: Sales.Product", "Sales.Customer", "Sales.Store"),
+        )
+        for path, first, second, old, new in cases:
+            with self.subTest(path=path):
+                expected = definition({path: first + "\n\n" + second})
+                reordered = second + "\n\n" + first
+                result = verify_publication(expected, definition({path: reordered}), "SemanticModel")
+                self.assertEqual({path: ["collection_order"]}, result["adjustments"])
+                with self.assertRaises(ValueError):
+                    verify_publication(expected, definition({path: reordered.replace(old, new)}), "SemanticModel")
+
+    def test_verbatim_query_lines_are_never_treated_as_column_declarations(self):
+        path = "definition/tables/Table.tmdl"
+        fence = "`" * 3
+        prefix = f'table Table\n\tpartition Table = m\n\t\tsource = {fence}\n"text\n'
+        suffix = f'\n\tcolumn C\n"\n{fence}'
+        expected = definition({path: prefix + "\tcolumn A\n\tcolumn B" + suffix})
+        actual = definition({path: prefix + "\tcolumn B\n\tcolumn A" + suffix})
+        with self.assertRaises(ValueError):
+            verify_publication(expected, actual, "SemanticModel")
 
     def test_windows_folder_names_are_safe(self):
         self.assertEqual("_CON", safe_name("CON"))

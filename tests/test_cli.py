@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from pbip_loader import cli
-from tests.test_workflows import FakeApi
+from tests.test_workflows import M, FakeApi
 
 
 class CliTests(unittest.TestCase):
@@ -40,8 +40,16 @@ class CliTests(unittest.TestCase):
                 plan = invoke("publish", key)
                 self.assertFalse(plan["applied"])
                 self.assertEqual(key, plan["target"]["key"])
+                model_plan = invoke("publish", key, "--model-only")
+                self.assertFalse(model_plan["applied"])
+                self.assertEqual([M], [item["id"] for item in model_plan["target"]["components"]])
                 self.assertEqual(api_calls, make_api.call_count)
                 self.assertFalse(api.updates)
+                published = invoke("publish", key, "--model-only", "--yes")
+                self.assertTrue(published["applied"])
+                self.assertEqual("verified", published["status"])
+                self.assertEqual([M], api.updates)
+                api.updates.clear()
                 self.assertTrue(invoke("publish", key, "--yes")["applied"])
                 self.assertEqual(len(model["components"]), len(api.updates))
 
